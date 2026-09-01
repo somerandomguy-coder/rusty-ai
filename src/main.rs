@@ -1,55 +1,38 @@
-use std::f64::consts::PI;
+use std::{f64::consts::PI, vec};
 
 use anyhow::Result;
-use candle_core::{DType, Device, Tensor};
-// use std::vec;
+use candle_core::{Device, Tensor};
 
 trait TensorExt {
-    #[warn(dead_code)]
-    fn print_self(&self) -> Result<()>;
-
-    fn z_norm(&self) -> Result<(Tensor, Tensor, Tensor, Tensor)>;
+    fn z_norm(&self) -> Result<Tensor>;
 }
 
 impl TensorExt for Tensor {
-    fn print_self(&self) -> Result<()> {
-        let num_rows = self.dims()[1];
-        let num_cols = self.dims()[2];
-        for i in 0..num_rows {
-            println!("\n-------");
-            for j in 0..num_cols {
-                let element = self.get(0)?.get(i)?.get(j)?;
-                print!("\nElement is {}", element);
-            }
-        }
-        Ok(())
-    }
-
-    fn z_norm(&self) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
+    fn z_norm(&self) -> Result<Tensor> {
         let data = self.clone();
 
-        let mean = self.mean_all()?;
-        let diff = data.broadcast_sub(&mean)?;
-        let variance = data.flatten_all()?.var(0)?;
-        let variance_copy = variance.copy()?;
+        let mean = self.mean(0)?; // (1, dims)
+        let diff = data.broadcast_sub(&mean)?; // (instance, dims)
+        let variance = diff.sqr()?.mean(0)?; // (1, dims)
         let stdev = (variance + 1e-8)?.sqrt()?;
 
-        // println!("----- debugging norm -----");
-        // println!("mean: {}\n\ndiff: {}\n\nstd: {}", mean, diff, stdev);
+        println!("----- debugging norm -----");
+        println!("mean: {}\n\ndiff: {}\n\nstd: {}", mean, diff, stdev);
 
         let norm = diff.broadcast_div(&stdev)?;
 
-        // println!("----- debugging norm -----");
-        // println!("norm_data is {}", norm);
-        Ok((norm, mean, stdev, variance_copy))
+        println!("norm_data is {}", norm);
+        println!("----- end debugging norm -----");
+        Ok(norm)
     }
 }
 
 fn load_data(device: &Device) -> Result<Tensor> {
-    let data: &[f32] = &[
-        1.1, 1.3, 1.5, 1.6, 1.2, 7.3, 1.2, 2.3, 1.1, 7.3, 1.5, 1.6, 1.2, 1.3, 1.2, 2.3,
+    let data: &[f64] = &[
+        1.1, 1.3, 1.5, 1.6, 1.1, 1.3, 1.5, 1.6, 1.2, 7.3, 1.2, 2.3, 1.1, 3.3, 1.5, 1.6, 1.2, 1.3,
+        1.2, 2.3, 1.2, 1.3, 1.2, 2.3,
     ];
-    let tensor = Tensor::from_slice(data, (4, 4), device)?;
+    let tensor = Tensor::from_slice(data, (6, 4), device)?;
     Ok(tensor)
 }
 
@@ -73,26 +56,31 @@ fn p_x(
 
 fn main() -> Result<()> {
     println!("Hello, world!");
+    println!("\n[CONFIG]");
     let device: Device = Device::Cpu;
     let data: Tensor = load_data(&device)?;
+    let threadshold = 1e-3;
+    println!("device: {:?},\nthreadshold: {threadshold}", device);
+    println!("[END CONFIG]\n");
     println!("Before normalize");
     println!("{}", data);
     // let _ = data.printSelf()?;
-    let tuple_norm = data.z_norm()?;
-    let norm_data = tuple_norm.0;
-    let mean = tuple_norm.1;
-    let stdev = tuple_norm.2;
-    let variance = tuple_norm.3;
-    let variance_f64: Tensor = variance.to_dtype(DType::F64)?;
-    let stdev_f64: Tensor = stdev.to_dtype(DType::F64)?;
+    let data = data.z_norm()?;
+    let variance_f64: Tensor = Tensor::new(1.0, &device)?;
+    let stdev_f64: Tensor = Tensor::new(1.0, &device)?;
+    let mean: Tensor = Tensor::new(0.0, &device)?;
 
     println!("After normalize");
-    println!("{norm_data},\nmean: {mean},\nstdev: {stdev}\nvariance: {variance}\n");
+    // println!("{data},\nmean: {mean},\nstdev: {stdev}\nvariance: {variance}\n");
 
     let two_variance: Tensor = variance_f64.broadcast_mul(&Tensor::new(2.0, &device)?)?;
     let two_pi_sqrt_std_dev: Tensor =
         stdev_f64.broadcast_mul(&Tensor::new(2.0 * PI, &device)?.sqrt()?)?;
 
+    println!(
+        "two_variance: {} two_pi_sqrt_std_dev: {:?} ",
+        two_variance, two_pi_sqrt_std_dev
+    );
     let data_shape = data.shape();
     let dims2 = data_shape.dims2()?;
     println!(
@@ -100,10 +88,28 @@ fn main() -> Result<()> {
         data, data_shape, dims2
     );
 
-    let rows = data.shape().dims2()?.0;
-    // for row in 0..rows {
+    let rows = dims2.0;
 
-    // }
+    let mut anomalies: Vec<f64> = vec![];
 
+    // println!(
+    //     "row: {:?}, column {:?}, vec: {:?}",
+    //     rows, columns, anomalies
+    // );
+
+    for row in 0..rows {
+        let row_tensor = data
+            .index_select(&Tensor::new(&[row as u32], &device)?, 0)?
+            .squeeze(0)?;
+        let px = p_x(&row_tensor, &mean, &two_variance, &two_pi_sqrt_std_dev)?;
+        //for now just push everything;
+
+        if px < threadshold {
+            println!("Anomaly at {}", row + 1);
+            anomalies.push(px * 100f64);
+        }
+    }
+
+    println!("p_x: {:?}", anomalies);
     Ok(())
 }
